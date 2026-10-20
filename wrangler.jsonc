@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "maasterbounty-api",
+  "main": "worker/index.mjs",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "nodejs_compat_populate_process_env",
+    "enable_nodejs_http_server_modules"
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "API_DATABASE", "class_name": "MaasterBountyApi" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MaasterBountyApi"] }
+  ],
+  "vars": {
+    "NODE_ENV": "production",
+    "PUBLIC_WEB_ORIGIN": "https://itsmaaster.xyz",
+    "COOKIE_SECURE": "true",
+    "TRUST_PROXY": "true",
+    "SERVER_NAME": "itsMaaster SMP"
+  }
+}

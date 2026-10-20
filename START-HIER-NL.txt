@@ -1,0 +1,36 @@
+MAASTER BOUNTY API — GRATIS VIA CLOUDFLARE
+
+Je hoeft Railway hiervoor niet te gebruiken of te betalen. Deze versie gebruikt een Cloudflare Worker met een ingebouwde SQLite-database.
+
+UPLOAD NAAR JE BESTAANDE GITHUB-REPO
+1. Pak deze zip uit.
+2. Open de repo maasterbounty-api op GitHub.
+3. Klik Add file → Upload files.
+4. Upload de INHOUD van deze map naar de hoofdmap van de repo. Je moet daar direct package.json en wrangler.jsonc zien. Upload niet de hele map als extra map.
+5. Klik Commit changes.
+
+DE WORKER AAN CLOUDFLARE KOPPELEN
+1. Cloudflare-dashboard → Workers & Pages → Create application → GitHub.
+2. Kies maasterbounty-api. Als Cloudflare om GitHub-toegang vraagt, geef toegang tot alleen die repo.
+3. Worker-naam: maasterbounty-api. Root directory: leeg laten. Laat de deploy-opdracht op de standaardwaarde npx wrangler deploy staan.
+4. Klik Save and Deploy.
+
+GEHEIME SLEUTEL INSTELLEN
+1. Open de Worker → Settings → Variables and Secrets.
+2. Voeg een ENCRYPTED SECRET toe met naam PLUGIN_HMAC_SECRET. Gebruik een willekeurige geheime tekst van minstens 32 tekens.
+3. Bewaar die tekst: exact dezelfde moet later in plugins/MaasterBounty/config.yml komen bij api.shared-secret.
+4. Deel die geheime tekst nooit in GitHub of op de website.
+
+API-ADRES MAKEN
+1. Open de Worker → Settings → Domains & Routes → Add → Custom Domain.
+2. Vul api.itsmaaster.xyz in en sla op. Cloudflare koppelt dit adres aan de Worker.
+3. Open https://api.itsmaaster.xyz/api/v1/status . Je hoort JSON te zien met backend status online.
+
+WEBSITE EN PLUGIN KOPPELEN
+- Websitebestand config.js: apiBase moet https://api.itsmaaster.xyz/api/v1 zijn.
+- Paper-config: plugins/MaasterBounty/config.yml → api.base-url = https://api.itsmaaster.xyz
+- Zet bij api.shared-secret dezelfde PLUGIN_HMAC_SECRET als in Cloudflare.
+- Herstart daarna Paper.
+
+GRATIS-LIMIETEN
+Cloudflare Free heeft dagelijkse limieten. Voor een kleine SMP is dit normaal ruim genoeg. Als je de limiet overschrijdt, weigert Cloudflare verdere verzoeken tot de limiet weer reset; er wordt niet automatisch een betaald plan gestart.
