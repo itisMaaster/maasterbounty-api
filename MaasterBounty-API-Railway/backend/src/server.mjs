@@ -1,12 +1,10 @@
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
-import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   claimEligible, constantTimeTextEqual, hash, kdRatio, pageArgs,
   publicPlayer, signature, validAmount, validUsername, validUuid
 } from "./core.mjs";
-import { all, db, get, run, transaction } from "./db.mjs";
+import { all, db, get, run, transaction } from "./db-cloudflare.mjs";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 8788);
@@ -100,11 +98,6 @@ function consumeRate(req, key, limit, periodMs = 60000) {
   bucket.hits++;
   return bucket.hits <= limit;
 }
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of rateBuckets) if (bucket.resetAt < now) rateBuckets.delete(key);
-  try { run("DELETE FROM plugin_nonces WHERE seen_at < ?", new Date(now - 10 * 60_000).toISOString()); } catch { /* A later request can prune them. */ }
-}, 5 * 60_000).unref();
 
 function parseCookies(req) {
   const raw = req.headers.cookie || ""; const values = {};
@@ -688,22 +681,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
-const expiryTimer = setInterval(() => {
-  try {
-    const now = ISO_NOW();
-    const expired = all("SELECT id, target_uuid FROM bounties WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=?", now);
-    transaction(() => {
-      for (const bounty of expired) {
-        run("UPDATE bounties SET status='expired', updated_at=?, version=version+1 WHERE id=? AND status='active'", now, bounty.id);
-        addAudit(null, "bounty_expired", "bounty", bounty.id, "expired");
-      }
-    });
-  } catch (error) { console.error(JSON.stringify({ level: "error", message: "Bounty expiry job failed", code: "expiry_job_failed" })); }
-}, 60_000);
-expiryTimer.unref();
 
 export { apiHandler };
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  server.listen(PORT, HOST, () => console.log(JSON.stringify({ level: "info", message: "SMP API listening", host: HOST, port: PORT, database: process.env.DATABASE_PATH || "./data/itsmaaster-smp.sqlite" })));
-  for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => { server.close(() => { try { db.close(); } finally { process.exit(0); } }); });
-}
+export { server };
+
