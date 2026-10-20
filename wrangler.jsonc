@@ -8,6 +8,18 @@
     "nodejs_compat_populate_process_env",
     "enable_nodejs_http_server_modules"
   ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 1
+    },
+    "issues": {
+      "enabled": true
+    }
+  },
   "durable_objects": {
     "bindings": [
       { "name": "API_DATABASE", "class_name": "MaasterBountyApi" }

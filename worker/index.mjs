@@ -8,8 +8,16 @@ const handleHttp = httpServerHandler(server);
 
 export default {
   async fetch(request, env) {
-    const id = env.API_DATABASE.idFromName("itsmaaster-bounty-api");
-    return env.API_DATABASE.get(id).fetch(request);
+    try {
+      const id = env.API_DATABASE.idFromName("itsmaaster-bounty-api");
+      return await env.API_DATABASE.get(id).fetch(request);
+    } catch (error) {
+      console.error("MaasterBounty API request failed", error);
+      return new Response(JSON.stringify({ error: "internal_error" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }
+      });
+    }
   }
 };
 
