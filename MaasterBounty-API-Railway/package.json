@@ -1,0 +1,7 @@
+{
+  "name": "maasterbounty-api",
+  "private": true,
+  "version": "1.0.0",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": { "start": "node backend/src/server.mjs" }
+}

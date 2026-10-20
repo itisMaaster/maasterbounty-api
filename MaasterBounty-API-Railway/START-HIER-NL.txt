@@ -1,0 +1,50 @@
+MAASTER BOUNTY API — simpele uitleg
+
+Dit is de API voor de SMP-website en Paper-plugin. Alleen de website op GitHub zetten is niet genoeg: de API moet ook op een server draaien.
+
+Makkelijkste route met deze bestaande code: Railway. Railway heeft een gratis plan met beperkte tegoeden; het Hobby-plan kost momenteel $5 per maand minimaal. Check de actuele prijs voordat je iets activeert: https://railway.com/pricing
+
+STAP 1 — zet deze bestanden in een GitHub-repo
+- Maak op GitHub een nieuwe repo aan, bijvoorbeeld maasterbounty-api.
+- Pak deze zip uit op je computer.
+- Upload de bestanden en mappen uit deze map naar de hoofdmap van die repo.
+- Je ziet daar dan package.json, backend en database.
+- Zet de repo op Private.
+
+STAP 2 — maak de API op Railway
+- Ga naar https://railway.com en log in met GitHub.
+- Kies New Project / Deploy from GitHub Repo en kies maasterbounty-api.
+- Wacht tot Railway klaar is met deployen.
+- Open de API-service en ga naar Variables. Voeg deze variabelen toe:
+  HOST = 0.0.0.0
+  NODE_ENV = production
+  DATABASE_PATH = /data/itsmaaster-smp.sqlite
+  PUBLIC_WEB_ORIGIN = https://itsmaaster.xyz
+  COOKIE_SECURE = true
+  TRUST_PROXY = true
+  PLUGIN_HMAC_SECRET = EEN_GEHEIME_RANDOM_SLEUTEL_VAN_MINSTENS_32_TEKENS
+- Verzin geen sleutel die je ergens anders gebruikt. Bewaar dezelfde sleutel voor de plugin.
+- PORT niet invullen; Railway levert die zelf.
+
+STAP 3 — zorg dat database bewaard blijft
+- Voeg in Railway een Volume toe aan de API-service.
+- Zet Mount Path op /data.
+- Dit is belangrijk: anders kan de database verdwijnen bij opnieuw deployen.
+
+STAP 4 — maak api.itsmaaster.xyz
+- Railway: service → Settings → Networking → Custom Domain.
+- Vul api.itsmaaster.xyz in. Railway toont een CNAME-record en een TXT-record.
+- Cloudflare → itsmaaster.xyz → DNS → voeg precies die twee records toe.
+- Laat Cloudflare Proxy eerst uit (grijze wolk), totdat Railway zegt dat het domein werkt.
+
+STAP 5 — test de API
+Open: https://api.itsmaaster.xyz/api/v1/status
+Je moet JSON zien met "status":"online".
+
+STAP 6 — verbind website en plugin
+- Websitebestand frontend/config.js: apiBase moet zijn "https://api.itsmaaster.xyz/api/v1".
+- Paper: plugins/MaasterBounty/config.yml → api.base-url = https://api.itsmaaster.xyz
+- Zet bij api.shared-secret exact dezelfde PLUGIN_HMAC_SECRET als in Railway.
+- Sla op en herstart daarna de Paper-server.
+
+Belangrijk: deel PLUGIN_HMAC_SECRET nooit op je website of in een openbare GitHub-repo. Zet hem alleen in Railway Variables en in de privé plugin-config op je server.
