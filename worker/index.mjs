@@ -4,7 +4,7 @@ import { server } from "../backend/src/server.mjs";
 import { all, bindDurableStorage, run, transaction } from "../backend/src/db-cloudflare.mjs";
 import { schemaSql } from "./schema.mjs";
 
-const handleHttp = httpServerHandler(server);
+const httpHandler = httpServerHandler(server);
 
 export default {
   async fetch(request, env) {
@@ -36,7 +36,11 @@ export class MaasterBountyApi extends DurableObject {
   async fetch(request) {
     await this.ready;
     bindDurableStorage(this.ctx.storage);
-    return handleHttp(request);
+    // httpServerHandler returns a module handler object (with a fetch method)
+    // in current Workers runtimes. Keep function support for older runtimes.
+    if (typeof httpHandler === "function") return httpHandler(request, this.env, this.ctx);
+    if (typeof httpHandler?.fetch === "function") return httpHandler.fetch(request, this.env, this.ctx);
+    throw new TypeError("Cloudflare HTTP server handler does not expose a fetch handler.");
   }
 
   async alarm() {
