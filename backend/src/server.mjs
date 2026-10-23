@@ -12,6 +12,8 @@ const COOKIE = process.env.COOKIE_NAME || "maaster_smp_session";
 const WEB_ORIGIN = process.env.PUBLIC_WEB_ORIGIN || "";
 const SECURE_COOKIE = process.env.COOKIE_SECURE !== "false";
 const CURRENCY = process.env.CURRENCY_NAME?.trim() || null;
+const MAX_BOUNTY_ITEMS = positiveInt(process.env.MAX_BOUNTY_ITEMS, 2304);
+const ITEM_CURRENCY_PREFIX = "ITEM:";
 const MIN_BOUNTY = positiveInt(process.env.MIN_BOUNTY, 100);
 const MAX_BOUNTY = positiveInt(process.env.MAX_BOUNTY, 100000);
 const EXPIRY_HOURS = positiveInt(process.env.DEFAULT_EXPIRY_HOURS, 72);
@@ -41,6 +43,12 @@ const rateBuckets = new Map();
 function positiveInt(value, fallback) {
   const result = Number(value);
   return Number.isSafeInteger(result) && result > 0 ? result : fallback;
+}
+function storedItemMaterial(currency) {
+  const value = String(currency || "");
+  if (!value.startsWith(ITEM_CURRENCY_PREFIX)) return null;
+  const material = value.slice(ITEM_CURRENCY_PREFIX.length);
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(material) ? material : null;
 }
 function reply(res, status, data, extra = {}) {
   const headers = {
@@ -172,8 +180,13 @@ function publicBounty(row) {
   if (!row) return null;
   const target = get("SELECT uuid, username, skin_url FROM players WHERE uuid=?", row.target_uuid);
   const contributors = get("SELECT count(DISTINCT contributor_uuid) AS count FROM contributions WHERE bounty_id=?", row.id)?.count || 0;
+  const itemMaterial = storedItemMaterial(row.currency);
+  const itemAmount = itemMaterial ? row.total_value : null;
   return { id: row.id, target: target ? { uuid: target.uuid, username: target.username, skinUrl: target.skin_url || null } : null,
-    totalValue: row.total_value, currency: row.currency, status: row.status, paymentStatus: row.payment_status,
+    totalValue: row.total_value, currency: itemMaterial || row.currency, bountyType: itemMaterial ? "item" : "currency",
+    itemType: itemMaterial, itemMaterial, itemAmount,
+    item: itemMaterial ? { material: itemMaterial, amount: itemAmount } : null,
+    status: row.status, paymentStatus: row.payment_status,
     contributorCount: contributors, createdAt: row.created_at, updatedAt: row.updated_at,
     expiresAt: row.expires_at, claimedAt: row.claimed_at,
     hunter: row.claimed_by ? publicPlayer(get("SELECT * FROM players WHERE uuid=?", row.claimed_by)) : null };
@@ -483,7 +496,14 @@ async function apiHandler(req, res) {
   return fail(res, 404, "not_found", "Endpoint not found.");
 }
 
-function transactionView(row) { return { id: row.id, type: row.type, status: row.status, amount: row.amount, currency: row.currency, createdAt: row.created_at, updatedAt: row.updated_at }; }
+function transactionView(row) {
+  const itemMaterial = storedItemMaterial(row.currency);
+  return { id: row.id, type: row.type, status: row.status, amount: row.amount,
+    currency: itemMaterial || row.currency, bountyType: itemMaterial ? "item" : "currency",
+    itemType: itemMaterial, itemMaterial, itemAmount: itemMaterial ? row.amount : null,
+    item: itemMaterial ? { material: itemMaterial, amount: row.amount } : null,
+    createdAt: row.created_at, updatedAt: row.updated_at };
+}
 
 function pluginHandler(req, res, url, path, body) {
   const now = ISO_NOW();
@@ -501,21 +521,61 @@ function pluginHandler(req, res, url, path, body) {
     return reply(res, 201, { code, expiresAt });
   }
   if (req.method === "POST" && path === "/plugin/placement-requests") {
-    if (!CURRENCY) return fail(res, 503, "currency_unconfigured", "Bounty placement is unavailable until the server economy currency is configured.");
-    const playerUuid = String(body.playerUuid || "").toLowerCase(); const playerUsername = String(body.playerUsername || ""); const targetUuid = String(body.targetUuid || "").toLowerCase();
-    const amount = body.amount; const requestKey = String(body.requestKey || "");
-    if (!validUuid(playerUuid) || !validUuid(targetUuid) || !validAmount(amount, MIN_BOUNTY, MAX_BOUNTY) || !/^[A-Za-z0-9_-]{12,100}$/.test(requestKey)) return fail(res, 400, "invalid_bounty", `Choose a tracked player and an amount from ${MIN_BOUNTY} to ${MAX_BOUNTY}.`);
+    // The installed Paper plugin places item bounties, not economy-currency bounties.
+    // Keep the existing signed plugin authentication, but read the actual item fields.
+    const playerUuid = String(body.playerUuid || "").toLowerCase();
+    const playerUsername = String(body.playerUsername || "");
+    const targetUuid = String(body.targetUuid || "").toLowerCase();
+    const bountyType = String(body.bountyType || "item").toLowerCase();
+    const nestedItem = body.item && typeof body.item === "object" && !Array.isArray(body.item) ? body.item : {};
+    const itemMaterial = String(body.itemMaterial || body.itemType || nestedItem.material || "").trim().toUpperCase();
+    const rawItemAmount = body.itemAmount ?? nestedItem.amount;
+    const requestKey = String(body.requestKey || "");
+    const itemAmount = typeof rawItemAmount === "number" ? rawItemAmount : Number(rawItemAmount);
+
+    if (bountyType !== "item") return fail(res, 400, "invalid_bounty_type", "This endpoint accepts item bounties only.");
+    if (!validUuid(playerUuid) || !validUuid(targetUuid) || !validUsername(playerUsername)
+      || !/^[A-Z][A-Z0-9_]{0,63}$/.test(itemMaterial)
+      || !Number.isSafeInteger(itemAmount) || itemAmount < 1 || itemAmount > MAX_BOUNTY_ITEMS
+      || !/^[A-Za-z0-9_-]{12,100}$/.test(requestKey)) {
+      return fail(res, 400, "invalid_bounty", `Choose a valid Minecraft item and a quantity from 1 to ${MAX_BOUNTY_ITEMS}.`);
+    }
     if (playerUuid === targetUuid) return fail(res, 400, "self_bounty_forbidden", "You cannot place a bounty on yourself.");
-    if (!validUsername(playerUsername) || !get("SELECT 1 FROM players WHERE uuid=?", targetUuid)) return fail(res, 404, "player_not_found", "The target must be a tracked player.");
+    if (!get("SELECT 1 FROM players WHERE uuid=?", targetUuid)) return fail(res, 404, "player_not_found", "The target must be a tracked player.");
+
     ensurePlayer(playerUuid, playerUsername, now);
     const fullKey = `${playerUuid}:command:${requestKey}`;
     const existing = get("SELECT * FROM transactions WHERE idempotency_key=?", fullKey);
-    if (existing) return reply(res, 202, { transaction: transactionView(existing) });
-    const active = get("SELECT id FROM bounties WHERE target_uuid=? AND status='active'", targetUuid);
-    const id = randomUUID();
-    run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'requested', ?, ?, ?)", id, playerUuid, targetUuid, active?.id || null, amount, CURRENCY, fullKey, now, now);
-    addAudit(playerUuid, "bounty_placement_requested_in_game", "transaction", id, "requested");
-    return reply(res, 202, { transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", id)) });
+    if (existing) {
+      const existingBounty = existing.bounty_id ? get("SELECT * FROM bounties WHERE id=?", existing.bounty_id) : null;
+      return reply(res, 202, { transaction: transactionView(existing), bounty: existingBounty ? publicBounty(existingBounty) : null });
+    }
+
+    const storedCurrency = `${ITEM_CURRENCY_PREFIX}${itemMaterial}`;
+    const active = get("SELECT * FROM bounties WHERE target_uuid=? AND status='active'", targetUuid);
+    if (active && storedItemMaterial(active.currency) !== itemMaterial) {
+      return fail(res, 409, "active_bounty_item_mismatch", "This player already has an active bounty with a different item. Wait for it to be claimed or expire first.");
+    }
+
+    const txId = randomUUID();
+    let bounty;
+    transaction(() => {
+      if (active) {
+        run("UPDATE bounties SET total_value=total_value+?, updated_at=?, version=version+1 WHERE id=? AND status='active'", itemAmount, now, active.id);
+        bounty = get("SELECT * FROM bounties WHERE id=?", active.id);
+      } else {
+        const bountyId = randomUUID();
+        const expires = new Date(Date.now() + EXPIRY_HOURS * 3600_000).toISOString();
+        run("INSERT INTO bounties (id, target_uuid, total_value, currency, status, payment_status, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, 'active', 'not_due', ?, ?, ?)", bountyId, targetUuid, itemAmount, storedCurrency, now, now, expires);
+        bounty = get("SELECT * FROM bounties WHERE id=?", bountyId);
+      }
+      run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at, completed_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)", txId, playerUuid, targetUuid, bounty.id, itemAmount, storedCurrency, fullKey, now, now, now);
+      run("INSERT INTO contributions (id, bounty_id, contributor_uuid, amount, transaction_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", randomUUID(), bounty.id, playerUuid, itemAmount, txId, now);
+      addActivity("bounty_placed", playerUuid, targetUuid, bounty.id, null, `${itemAmount}x ${itemMaterial}`);
+      addAudit(playerUuid, "bounty_placement_confirmed", "bounty", bounty.id, "completed_item_bounty");
+    });
+    const savedTx = get("SELECT * FROM transactions WHERE id=?", txId);
+    return reply(res, 202, { transaction: transactionView(savedTx), bounty: publicBounty(get("SELECT * FROM bounties WHERE id=?", bounty.id)) });
   }
   if (req.method === "POST" && path === "/plugin/heartbeat") {
     const onlinePlayers = body.onlinePlayers == null ? null : Number(body.onlinePlayers);
@@ -684,4 +744,3 @@ const server = createServer(async (req, res) => {
 
 export { apiHandler };
 export { server };
-
