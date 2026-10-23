@@ -442,23 +442,42 @@ async function apiHandler(req, res) {
   }
   if (req.method === "POST" && path === "/bounties") {
     const session = requireSession(req, res); if (!session) return;
-    if (!CURRENCY) return fail(res, 503, "currency_unconfigured", "Bounty placement is unavailable until the server economy currency is configured.");
     const idempotency = String(req.headers["idempotency-key"] || "");
     if (!/^[A-Za-z0-9_-]{12,100}$/.test(idempotency)) return fail(res, 400, "idempotency_key_required", "A valid idempotency key is required.");
     const { value } = await readJson(req, 4096);
-    const targetUuid = String(value.targetUuid || "").toLowerCase(); const amount = value.amount;
-    if (!validUuid(targetUuid) || !validAmount(amount, MIN_BOUNTY, MAX_BOUNTY)) return fail(res, 400, "invalid_bounty", `Choose a tracked player and an amount from ${MIN_BOUNTY} to ${MAX_BOUNTY}.`);
+    const targetUuid = String(value.targetUuid || "").toLowerCase();
+    const bountyType = String(value.bountyType || "item").toLowerCase();
+    const nestedItem = value.item && typeof value.item === "object" && !Array.isArray(value.item) ? value.item : {};
+    const itemMaterial = String(value.itemMaterial || value.itemType || nestedItem.material || "").trim().replace(/^minecraft:/i, "").toUpperCase();
+    const rawItemAmount = value.itemAmount ?? nestedItem.amount;
+    const itemAmount = typeof rawItemAmount === "number" ? rawItemAmount : Number(rawItemAmount);
+    if (bountyType !== "item") return fail(res, 400, "invalid_bounty_type", "Only item bounties are supported.");
+    if (!validUuid(targetUuid) || !/^[A-Z][A-Z0-9_]{0,63}$/.test(itemMaterial)
+      || !Number.isSafeInteger(itemAmount) || itemAmount < 1 || itemAmount > MAX_BOUNTY_ITEMS) {
+      return fail(res, 400, "invalid_bounty", `Choose a valid Minecraft item and a quantity from 1 to ${MAX_BOUNTY_ITEMS}.`);
+    }
     if (targetUuid === session.player_uuid) return fail(res, 400, "self_bounty_forbidden", "You cannot place a bounty on yourself.");
     if (!get("SELECT 1 FROM players WHERE uuid=?", targetUuid)) return fail(res, 404, "target_not_found", "The target must be a tracked player.");
     const fullKey = `${session.player_uuid}:${idempotency}`;
     const existing = get("SELECT * FROM transactions WHERE idempotency_key=?", fullKey);
     if (existing) return reply(res, 202, { transaction: transactionView(existing) }, { "Cache-Control": "private, no-store" });
-    const active = get("SELECT id FROM bounties WHERE target_uuid=? AND status='active'", targetUuid);
+
+    const storedCurrency = `${ITEM_CURRENCY_PREFIX}${itemMaterial}`;
+    const active = get("SELECT * FROM bounties WHERE target_uuid=? AND status='active'", targetUuid);
+    if (active && storedItemMaterial(active.currency) !== itemMaterial) {
+      return fail(res, 409, "active_bounty_item_mismatch", "This player already has an active bounty with a different item. Wait for it to be claimed or expire first.");
+    }
+    const pendingMismatch = get("SELECT id FROM transactions WHERE target_uuid=? AND type='placement' AND status IN ('requested','processing') AND currency<>? LIMIT 1", targetUuid, storedCurrency);
+    if (pendingMismatch) {
+      return fail(res, 409, "pending_bounty_item_mismatch", "A different item bounty request is already waiting for this target. Try again after it is processed.");
+    }
+
     const now = ISO_NOW(); const txId = randomUUID();
-    run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'requested', ?, ?, ?)", txId, session.player_uuid, targetUuid, active?.id || null, amount, CURRENCY, fullKey, now, now);
-    addAudit(session.player_uuid, "bounty_placement_requested", "transaction", txId, "requested");
+    run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'requested', ?, ?, ?)", txId, session.player_uuid, targetUuid, active?.id || null, itemAmount, storedCurrency, fullKey, now, now);
+    addAudit(session.player_uuid, "item_bounty_placement_requested", "transaction", txId, "requested");
     return reply(res, 202, { transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", txId)) }, { "Cache-Control": "private, no-store" });
   }
+
   const adminMatch = path.match(/^\/admin\/transactions\/([0-9a-f-]{36})(?:\/(retry|reconcile))?$/i);
   if (adminMatch) {
     if (!requireAdmin(req, res)) return;
@@ -628,8 +647,20 @@ function pluginHandler(req, res, url, path, body) {
     const type = url.searchParams.get("type") || "";
     if (type && !["placement", "payout", "refund"].includes(type)) return fail(res, 400, "invalid_transaction_type", "Transaction type is invalid.");
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 30)));
-    const rows = type ? all("SELECT * FROM transactions WHERE type=? AND status IN ('requested','processing') ORDER BY created_at LIMIT ?", type, limit)
+    const candidates = type ? all("SELECT * FROM transactions WHERE type=? AND status IN ('requested','processing') ORDER BY created_at LIMIT ?", type, limit)
       : all("SELECT * FROM transactions WHERE status IN ('requested','processing') ORDER BY created_at LIMIT ?", limit);
+    const rows = [];
+    for (const row of candidates) {
+      if (row.type === "placement" && storedItemMaterial(row.currency)) {
+        const active = get("SELECT id, currency FROM bounties WHERE target_uuid=? AND status='active'", row.target_uuid);
+        if (active && active.currency !== row.currency) {
+          run("UPDATE transactions SET status='failed', updated_at=?, safe_error_code='active_bounty_item_mismatch' WHERE id=? AND status IN ('requested','processing')", now, row.id);
+          addAudit(row.player_uuid, "item_bounty_placement_rejected", "transaction", row.id, "active_bounty_item_mismatch");
+          continue;
+        }
+      }
+      rows.push(row);
+    }
     transaction(() => { for (const row of rows) run("UPDATE transactions SET status='processing', updated_at=? WHERE id=? AND status='requested'", now, row.id); });
     return reply(res, 200, { items: rows.map((row) => ({ ...transactionView({ ...row, status: "processing" }), playerUuid: row.player_uuid, targetUuid: row.target_uuid, bountyId: row.bounty_id })) });
   }
