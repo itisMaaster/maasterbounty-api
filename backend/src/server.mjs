@@ -22,6 +22,7 @@ const KD_MIN = positiveInt(process.env.KD_MINIMUM_KILLS, 10);
 const HEARTBEAT_STALE = positiveInt(process.env.HEARTBEAT_STALE_SECONDS, 90);
 const PLUGIN_SECRET = process.env.PLUGIN_HMAC_SECRET || "";
 const ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || "";
+const SMP_ADMIN_TOKEN = process.env.SMP_ADMIN_TOKEN || "";
 const BUILD_VERSION = "1.0.0";
 const ISO_NOW = () => new Date().toISOString();
 const SORTS = {
@@ -90,8 +91,8 @@ function allowedOrigin(req, res) {
   if (WEB_ORIGIN && origin === WEB_ORIGIN) {
     res.setHeader("Access-Control-Allow-Origin", WEB_ORIGIN);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token, Idempotency-Key");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token, Idempotency-Key, Authorization");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Vary", "Origin");
     return true;
   }
@@ -138,6 +139,15 @@ function requireAdmin(req, res) {
   }
   return true;
 }
+function requireSmpAdmin(req, res) {
+  const supplied = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!SMP_ADMIN_TOKEN || SMP_ADMIN_TOKEN.length < 32 || !constantTimeTextEqual(supplied, SMP_ADMIN_TOKEN)) {
+    fail(res, SMP_ADMIN_TOKEN ? 403 : 503, SMP_ADMIN_TOKEN ? "admin_forbidden" : "admin_unconfigured", "SMP administration is unavailable.");
+    return false;
+  }
+  return true;
+}
+
 function validatePlayerIdentity(uuid, username) {
   return validUuid(uuid) && validUsername(username);
 }
@@ -274,6 +284,19 @@ async function apiHandler(req, res) {
   if (!url.pathname.startsWith("/api/v1/")) return fail(res, 404, "not_found", "Endpoint not found.");
   const path = url.pathname.slice("/api/v1".length);
 
+  // Public community endpoints. Chat is shown only after the server bridge confirms delivery.
+  if (req.method === "GET" && path === "/announcements") {
+    const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+    const items = all("SELECT id, title, body, pinned, author, created_at FROM smp_announcements WHERE active=1 ORDER BY pinned DESC, created_at DESC LIMIT ?", limit)
+      .map((row) => ({ id: row.id, title: row.title, body: row.body, pinned: Boolean(row.pinned), author: row.author, createdAt: row.created_at }));
+    return reply(res, 200, { items, total: get("SELECT count(*) AS total FROM smp_announcements WHERE active=1")?.total || 0 });
+  }
+  if (req.method === "GET" && path === "/chat") {
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const rows = all("SELECT id, username, message, source, created_at FROM smp_chat_messages WHERE status='delivered' ORDER BY created_at DESC LIMIT ?", limit).reverse();
+    return reply(res, 200, { items: rows.map((row) => ({ id: row.id, username: row.username, message: row.message, source: row.source, createdAt: row.created_at })), total: get("SELECT count(*) AS total FROM smp_chat_messages WHERE status='delivered'")?.total || 0 });
+  }
+
   if (path.startsWith("/plugin/")) {
     if (req.method !== "POST" && req.method !== "GET") return fail(res, 405, "method_not_allowed", "Method not allowed.");
     let raw = ""; let body = {};
@@ -295,6 +318,8 @@ async function apiHandler(req, res) {
   }
   if (req.method === "GET" && path === "/overview") {
     const totals = get(`SELECT count(*) AS players, coalesce(sum(kills),0) AS playerKills,
+      coalesce(sum(deaths),0) AS playerDeaths, coalesce(sum(mob_kills),0) AS mobKills,
+      coalesce(sum(blocks_mined),0) AS blocksMined,
       (SELECT count(*) FROM bounties WHERE status='active') AS activeBounties,
       (SELECT coalesce(sum(total_value),0) FROM bounties WHERE status='active') AS activeBountyValue,
       (SELECT coalesce(sum(playtime_seconds),0) FROM players) AS playtimeSeconds,
@@ -478,6 +503,44 @@ async function apiHandler(req, res) {
     return reply(res, 202, { transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", txId)) }, { "Cache-Control": "private, no-store" });
   }
 
+  if (path === "/admin/ping" && req.method === "GET") {
+    if (!consumeRate(req, "smp-admin-ping", 15, 60_000)) return fail(res, 429, "rate_limited", "Too many admin authentication attempts. Try again shortly.");
+    if (!requireSmpAdmin(req, res)) return;
+    return reply(res, 200, { ok: true, role: "admin" }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/announcements" && req.method === "POST") {
+    if (!requireSmpAdmin(req, res)) return;
+    const { value } = await readJson(req, 8192);
+    const title = String(value.title || "").trim();
+    const body = String(value.body || "").trim();
+    const pinned = value.pinned === true ? 1 : 0;
+    if (!title || title.length > 100 || !body || body.length > 3000) return fail(res, 400, "invalid_announcement", "Enter a title (1–100 characters) and message (1–3000 characters).");
+    const id = randomUUID(); const now = ISO_NOW();
+    run("INSERT INTO smp_announcements (id, title, body, pinned, active, author, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)", id, title, body, pinned, "Maaster", now);
+    addAudit("admin", "announcement_created", "announcement", id, "published");
+    return reply(res, 201, { item: { id, title, body, pinned: Boolean(pinned), author: "Maaster", createdAt: now } });
+  }
+  const announcementDeleteMatch = path.match(/^\/admin\/announcements\/([0-9a-f-]{36})$/i);
+  if (announcementDeleteMatch && req.method === "DELETE") {
+    if (!requireSmpAdmin(req, res)) return;
+    const id = announcementDeleteMatch[1].toLowerCase();
+    const row = get("SELECT id FROM smp_announcements WHERE id=? AND active=1", id);
+    if (!row) return fail(res, 404, "announcement_not_found", "Announcement not found.");
+    run("UPDATE smp_announcements SET active=0 WHERE id=?", id);
+    addAudit("admin", "announcement_hidden", "announcement", id, "hidden");
+    return reply(res, 200, { ok: true });
+  }
+  if (path === "/admin/chat" && req.method === "POST") {
+    if (!requireSmpAdmin(req, res)) return;
+    const { value } = await readJson(req, 4096);
+    const message = String(value.message || "").trim();
+    if (!message || message.length > 256 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(message)) return fail(res, 400, "invalid_chat_message", "Enter a chat message between 1 and 256 characters.");
+    const id = randomUUID(); const now = ISO_NOW();
+    run("INSERT INTO smp_chat_messages (id, source_event_id, player_uuid, username, message, source, status, created_at, updated_at, delivered_at) VALUES (?, NULL, NULL, ?, ?, 'admin', 'pending', ?, ?, NULL)", id, "Maaster", message, now, now);
+    addAudit("admin", "server_chat_queued", "chat_message", id, "pending_delivery");
+    return reply(res, 202, { item: { id, username: "Maaster", message, source: "admin", status: "pending", createdAt: now } });
+  }
+
   const adminMatch = path.match(/^\/admin\/transactions\/([0-9a-f-]{36})(?:\/(retry|reconcile))?$/i);
   if (adminMatch) {
     if (!requireAdmin(req, res)) return;
@@ -538,6 +601,38 @@ function pluginHandler(req, res, url, path, body) {
     const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
     run("INSERT INTO link_codes (code_hash, player_uuid, expires_at, created_at) VALUES (?, ?, ?, ?)", hash(code), uuid, expiresAt, now);
     return reply(res, 201, { code, expiresAt });
+  }
+  if (req.method === "POST" && path === "/plugin/chat") {
+    const eventId = String(body.eventId || "");
+    const uuid = String(body.uuid || "").toLowerCase();
+    const username = String(body.username || "");
+    const message = String(body.message || "");
+    if (!/^[A-Za-z0-9-]{8,100}$/.test(eventId) || !validatePlayerIdentity(uuid, username)
+      || !message.trim() || message.length > 256 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(message)) {
+      return fail(res, 400, "invalid_chat_event", "Chat event details are invalid.");
+    }
+    if (get("SELECT 1 FROM smp_chat_messages WHERE source_event_id=?", eventId)) return reply(res, 200, { ok: true, duplicate: true });
+    ensurePlayer(uuid, username, now);
+    run("INSERT INTO smp_chat_messages (id, source_event_id, player_uuid, username, message, source, status, created_at, updated_at, delivered_at) VALUES (?, ?, ?, ?, ?, 'minecraft', 'delivered', ?, ?, ?)", randomUUID(), eventId, uuid, username, message, now, now, now);
+    return reply(res, 201, { ok: true, receivedAt: now });
+  }
+  if (req.method === "GET" && path === "/plugin/chat-outbox") {
+    const limit = Math.min(20, Math.max(1, Number(url.searchParams.get("limit") || 10)));
+    const requeueBefore = new Date(Date.now() - 60_000).toISOString();
+    const rows = all("SELECT id, username, message FROM smp_chat_messages WHERE source='admin' AND (status='pending' OR (status='processing' AND updated_at<?)) ORDER BY created_at ASC LIMIT ?", requeueBefore, limit);
+    transaction(() => { for (const row of rows) run("UPDATE smp_chat_messages SET status='processing', updated_at=? WHERE id=? AND status IN ('pending','processing')", now, row.id); });
+    return reply(res, 200, { items: rows });
+  }
+  const chatResultMatch = path.match(/^\/plugin\/chat-outbox\/([0-9a-f-]{36})\/result$/i);
+  if (req.method === "POST" && chatResultMatch) {
+    const id = chatResultMatch[1].toLowerCase();
+    const outcome = String(body.outcome || "");
+    if (!["delivered", "failed"].includes(outcome)) return fail(res, 400, "invalid_chat_outcome", "Chat delivery outcome is invalid.");
+    const row = get("SELECT id, status FROM smp_chat_messages WHERE id=? AND source='admin'", id);
+    if (!row) return fail(res, 404, "chat_message_not_found", "Queued chat message not found.");
+    const deliveredAt = outcome === "delivered" ? now : null;
+    run("UPDATE smp_chat_messages SET status=?, updated_at=?, delivered_at=? WHERE id=?", outcome, now, deliveredAt, id);
+    return reply(res, 200, { ok: true, status: outcome });
   }
   if (req.method === "POST" && path === "/plugin/placement-requests") {
     // The installed Paper plugin places item bounties, not economy-currency bounties.
