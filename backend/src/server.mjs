@@ -527,8 +527,28 @@ async function apiHandler(req, res) {
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
     const search = String(url.searchParams.get("search") || "").trim().slice(0, 32);
     const safe = search.replace(/[\\%_]/g, "\\$&");
-    const rows = all("SELECT p.uuid, p.username, p.kills, p.deaths, p.playtime_seconds, p.online, p.last_seen FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) AND (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE) ORDER BY p.last_seen DESC LIMIT ?", search, `%${safe}%`, limit);
-    return reply(res, 200, { items: rows.map(p => ({ uuid:p.uuid, username:p.username, kills:p.kills, deaths:p.deaths, playtimeSeconds:p.playtime_seconds, online:p.online == null ? null : Boolean(p.online), lastSeen:p.last_seen })), total: rows.length });
+    // Hidden players are returned only when explicitly requested by the protected admin UI.
+    const includeHidden = url.searchParams.get("includeHidden") === "1";
+    const visibilityFilter = includeHidden ? "1=1" : "p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)";
+    const rows = all(`SELECT p.uuid, p.username, p.kills, p.deaths, p.playtime_seconds, p.online, p.last_seen,
+      EXISTS (SELECT 1 FROM smp_hidden_players h WHERE h.player_uuid=p.uuid) AS hidden
+      FROM players p WHERE ${visibilityFilter} AND (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE)
+      ORDER BY p.last_seen DESC LIMIT ?`, search, `%${safe}%`, limit);
+    return reply(res, 200, { items: rows.map(p => ({ uuid:p.uuid, username:p.username, kills:p.kills, deaths:p.deaths, playtimeSeconds:p.playtime_seconds, online:p.online == null ? null : Boolean(p.online), lastSeen:p.last_seen, hidden:Boolean(p.hidden) })), total: rows.length });
+  }
+  const unhidePlayerMatch = path.match(/^\/admin\/players\/([0-9a-f-]{36})\/unhide$/i);
+  if (unhidePlayerMatch && req.method === "POST") {
+    if (!requireSmpAdmin(req, res)) return;
+    const uuid = unhidePlayerMatch[1].toLowerCase();
+    if (!validUuid(uuid)) return fail(res, 400, "invalid_player_uuid", "Player UUID is invalid.");
+    const player = get("SELECT uuid, username FROM players WHERE uuid=?", uuid);
+    if (!player) return fail(res, 404, "player_not_found", "Player not found in tracked records.");
+    const wasHidden = isHiddenPlayer(uuid);
+    transaction(() => {
+      run("DELETE FROM smp_hidden_players WHERE player_uuid=?", uuid);
+      addAudit("admin", "player_restored_to_public_site", "player", uuid, wasHidden ? "unhidden" : "already_visible");
+    });
+    return reply(res, 200, { ok:true, player:player.username, hidden:false, wasHidden, note:"Player is visible again. New public chat messages can be mirrored." });
   }
   const removePlayerMatch = path.match(/^\/admin\/players\/([0-9a-f-]{36})$/i);
   if (removePlayerMatch && req.method === "DELETE") {
