@@ -63,6 +63,21 @@ export class MaasterBountyApi extends DurableObject {
         hidden_by TEXT NOT NULL DEFAULT 'admin'
       )`);
       ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_hidden_players_uuid ON smp_hidden_players(player_uuid)");
+      // Additive-only inventory and item catalog tables. Existing player, bounty, transaction and audit rows are not reset.
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_material_catalog (
+        material TEXT PRIMARY KEY,
+        updated_at TEXT NOT NULL
+      )`);
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_inventory_snapshots (
+        player_uuid TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        inventory_json TEXT NOT NULL,
+        online INTEGER NOT NULL DEFAULT 0 CHECK (online IN (0, 1)),
+        updated_at TEXT NOT NULL,
+        event_id TEXT NOT NULL
+      )`);
+      ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_inventory_snapshots_online ON smp_inventory_snapshots(online, updated_at)");
+      ctx.storage.sql.exec("INSERT OR IGNORE INTO smp_settings (key, value, updated_at) VALUES ('bounties_enabled', '1', datetime('now'))");
       if (await ctx.storage.getAlarm() === null) {
         await ctx.storage.setAlarm(Date.now() + 60_000);
       }
