@@ -151,7 +151,14 @@ function requireSmpAdmin(req, res) {
 function validatePlayerIdentity(uuid, username) {
   return validUuid(uuid) && validUsername(username);
 }
+function isHiddenPlayer(uuid) {
+  return Boolean(uuid && get("SELECT 1 FROM smp_hidden_players WHERE player_uuid=?", String(uuid).toLowerCase()));
+}
+function mirrorChatEnabled() {
+  return get("SELECT value FROM smp_settings WHERE key='mirror_chat_enabled'")?.value !== "0";
+}
 function ensurePlayer(uuid, username, now = ISO_NOW()) {
+  if (isHiddenPlayer(uuid)) return false;
   const previous = get("SELECT username FROM players WHERE uuid=?", uuid);
   if (!previous) {
     run("INSERT INTO players (uuid, username, first_seen, last_seen, updated_at) VALUES (?, ?, ?, ?, ?)", uuid, username, now, now, now);
@@ -162,9 +169,9 @@ function ensurePlayer(uuid, username, now = ISO_NOW()) {
   }
 }
 function getPlayerByIdentity(identity) {
-  if (validUuid(identity)) return get("SELECT * FROM players WHERE uuid=?", identity.toLowerCase());
-  if (!validUsername(identity)) return null;
-  return get("SELECT * FROM players WHERE username=? COLLATE NOCASE ORDER BY last_seen DESC LIMIT 1", identity);
+  const row = validUuid(identity) ? get("SELECT * FROM players WHERE uuid=?", identity.toLowerCase())
+    : validUsername(identity) ? get("SELECT * FROM players WHERE username=? COLLATE NOCASE ORDER BY last_seen DESC LIMIT 1", identity) : null;
+  return row && !isHiddenPlayer(row.uuid) ? row : null;
 }
 function currentServer() {
   const heartbeat = get("SELECT * FROM server_heartbeat WHERE singleton=1");
@@ -188,7 +195,7 @@ function publicActivity(row) {
 }
 function publicBounty(row) {
   if (!row) return null;
-  const target = get("SELECT uuid, username, skin_url FROM players WHERE uuid=?", row.target_uuid);
+  const target = isHiddenPlayer(row.target_uuid) ? null : get("SELECT uuid, username, skin_url FROM players WHERE uuid=?", row.target_uuid);
   const contributors = get("SELECT count(DISTINCT contributor_uuid) AS count FROM contributions WHERE bounty_id=?", row.id)?.count || 0;
   const itemMaterial = storedItemMaterial(row.currency);
   const itemAmount = itemMaterial ? row.total_value : null;
@@ -199,7 +206,7 @@ function publicBounty(row) {
     status: row.status, paymentStatus: row.payment_status,
     contributorCount: contributors, createdAt: row.created_at, updatedAt: row.updated_at,
     expiresAt: row.expires_at, claimedAt: row.claimed_at,
-    hunter: row.claimed_by ? publicPlayer(get("SELECT * FROM players WHERE uuid=?", row.claimed_by)) : null };
+    hunter: row.claimed_by && !isHiddenPlayer(row.claimed_by) ? publicPlayer(get("SELECT * FROM players WHERE uuid=?", row.claimed_by)) : null };
 }
 function aggregatePlayer(uuid) {
   const bountyClaims = get("SELECT count(*) AS value FROM bounties WHERE claimed_by=?", uuid)?.value || 0;
@@ -216,8 +223,8 @@ function leaderboardQuery(category, limit, offset) {
     const slug = category.slice("weapon:".length);
     if (!/^[a-z0-9-]{1,64}$/.test(slug)) return null;
     return {
-      sql: `SELECT p.*, wk.kills AS value FROM weapon_kills wk JOIN players p ON p.uuid=wk.player_uuid JOIN weapons w ON w.id=wk.weapon_id WHERE w.slug=? AND w.public=1 ORDER BY value DESC, p.uuid ASC LIMIT ? OFFSET ?`,
-      params: [slug, limit, offset], countSql: "SELECT count(*) AS total FROM weapon_kills wk JOIN weapons w ON w.id=wk.weapon_id WHERE w.slug=? AND w.public=1", countParams: [slug]
+      sql: `SELECT p.*, wk.kills AS value FROM weapon_kills wk JOIN players p ON p.uuid=wk.player_uuid JOIN weapons w ON w.id=wk.weapon_id WHERE w.slug=? AND w.public=1 AND p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) ORDER BY value DESC, p.uuid ASC LIMIT ? OFFSET ?`,
+      params: [slug, limit, offset], countSql: "SELECT count(*) AS total FROM weapon_kills wk JOIN players p ON p.uuid=wk.player_uuid JOIN weapons w ON w.id=wk.weapon_id WHERE w.slug=? AND w.public=1 AND p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)", countParams: [slug]
     };
   }
   if (!Object.hasOwn(SORTS, category)) return null;
@@ -227,10 +234,11 @@ function leaderboardQuery(category, limit, offset) {
     LEFT JOIN (SELECT contributor_uuid AS uuid, sum(amount) AS value FROM contributions GROUP BY contributor_uuid) bv ON bv.uuid=p.uuid
     LEFT JOIN (SELECT claimed_by AS uuid, max(total_value) AS value FROM bounties WHERE claimed_by IS NOT NULL GROUP BY claimed_by) lc ON lc.uuid=p.uuid`;
   const joins = ["bountyClaims", "bountyEarned", "bountiesPlaced", "bountyPlacedValue", "largestClaim"].includes(category) ? extraJoins : "";
-  const minClause = category === "kd" ? "WHERE p.kills >= ? AND p.deaths > 0"
-    : category === "mobKills" ? "WHERE p.mob_kills IS NOT NULL"
-      : category === "playtime" ? "WHERE p.playtime_seconds IS NOT NULL"
-        : category === "bountyClaims" || category === "bountyEarned" || category === "bountiesPlaced" || category === "bountyPlacedValue" || category === "largestClaim" ? `WHERE ${SORTS[category]} > 0` : "";
+  const hidden = "p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)";
+  const minClause = category === "kd" ? `WHERE ${hidden} AND p.kills >= ? AND p.deaths > 0`
+    : category === "mobKills" ? `WHERE ${hidden} AND p.mob_kills IS NOT NULL`
+      : category === "playtime" ? `WHERE ${hidden} AND p.playtime_seconds IS NOT NULL`
+        : category === "bountyClaims" || category === "bountyEarned" || category === "bountiesPlaced" || category === "bountyPlacedValue" || category === "largestClaim" ? `WHERE ${hidden} AND ${SORTS[category]} > 0` : `WHERE ${hidden}`;
   const params = category === "kd" ? [KD_MIN, limit, offset] : [limit, offset];
   return {
     sql: `SELECT p.*, ${SORTS[category]} AS value FROM players p ${joins} ${minClause} ORDER BY value DESC, p.uuid ASC LIMIT ? OFFSET ?`,
@@ -293,8 +301,8 @@ async function apiHandler(req, res) {
   }
   if (req.method === "GET" && path === "/chat") {
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
-    const rows = all("SELECT id, username, message, source, created_at FROM smp_chat_messages WHERE status='delivered' ORDER BY created_at DESC LIMIT ?", limit).reverse();
-    return reply(res, 200, { items: rows.map((row) => ({ id: row.id, username: row.username, message: row.message, source: row.source, createdAt: row.created_at })), total: get("SELECT count(*) AS total FROM smp_chat_messages WHERE status='delivered'")?.total || 0 });
+    const rows = all("SELECT id, username, message, source, created_at FROM smp_chat_messages WHERE status='delivered' AND (player_uuid IS NULL OR player_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) ORDER BY created_at DESC LIMIT ?", limit).reverse();
+    return reply(res, 200, { items: rows.map((row) => ({ id: row.id, username: row.username, message: row.message, source: row.source, createdAt: row.created_at })), total: get("SELECT count(*) AS total FROM smp_chat_messages WHERE status='delivered' AND (player_uuid IS NULL OR player_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players))")?.total || 0, mirrorChatEnabled: mirrorChatEnabled() });
   }
 
   if (path.startsWith("/plugin/")) {
@@ -317,20 +325,20 @@ async function apiHandler(req, res) {
     return reply(res, 200, { gameServer: currentServer(), backend: { status: "online", databaseStatus, checkedAt: ISO_NOW(), version: BUILD_VERSION } });
   }
   if (req.method === "GET" && path === "/overview") {
-    const totals = get(`SELECT count(*) AS players, coalesce(sum(kills),0) AS playerKills,
-      coalesce(sum(deaths),0) AS playerDeaths, coalesce(sum(mob_kills),0) AS mobKills,
-      coalesce(sum(blocks_mined),0) AS blocksMined,
-      (SELECT count(*) FROM bounties WHERE status='active') AS activeBounties,
-      (SELECT coalesce(sum(total_value),0) FROM bounties WHERE status='active') AS activeBountyValue,
-      (SELECT coalesce(sum(playtime_seconds),0) FROM players) AS playtimeSeconds,
-      (SELECT count(*) FROM bounties WHERE status='claimed') AS bountyClaims FROM players`);
+    const totals = get(`SELECT count(*) AS players, coalesce(sum(p.kills),0) AS playerKills,
+      coalesce(sum(p.deaths),0) AS playerDeaths, coalesce(sum(p.mob_kills),0) AS mobKills,
+      coalesce(sum(p.blocks_mined),0) AS blocksMined,
+      (SELECT count(*) FROM bounties WHERE status='active' AND target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AS activeBounties,
+      (SELECT coalesce(sum(total_value),0) FROM bounties WHERE status='active' AND target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AS activeBountyValue,
+      (SELECT coalesce(sum(p2.playtime_seconds),0) FROM players p2 WHERE p2.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AS playtimeSeconds,
+      (SELECT count(*) FROM bounties WHERE status='claimed' AND target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AS bountyClaims FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)`);
     const leaders = {};
     for (const [category, key] of [["kills", "kills"], ["killstreak", "killstreak"], ["kd", "kd"], ["bountyClaims", "bountyClaims"]]) {
       const board = leaderboardRows(category, 1, 0); const item = board?.items[0];
       leaders[key] = item ? { ...item.player, value: item.value, [category === "kd" ? "kd_ratio" : category === "kills" ? "player_kills" : category === "killstreak" ? "best_killstreak" : "bounties_claimed"]: item.value } : null;
     }
-    const bounties = all("SELECT * FROM bounties WHERE status='active' ORDER BY total_value DESC, created_at DESC LIMIT 3").map(publicBounty);
-    const activity = all("SELECT * FROM activity ORDER BY created_at DESC, id DESC LIMIT 5").map(publicActivity);
+    const bounties = all("SELECT * FROM bounties WHERE status='active' AND target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) ORDER BY total_value DESC, created_at DESC LIMIT 3").map(publicBounty);
+    const activity = all("SELECT * FROM activity WHERE (actor_uuid IS NULL OR actor_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AND (target_uuid IS NULL OR target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) ORDER BY created_at DESC, id DESC LIMIT 5").map(publicActivity);
     return reply(res, 200, { generatedAt: ISO_NOW(), server: currentServer(), totals: { ...totals, currency: CURRENCY }, leaders, bounties, activity });
   }
   if (req.method === "GET" && path === "/players") {
@@ -346,9 +354,9 @@ async function apiHandler(req, res) {
     const onlineValue = onlineFilter === "online" ? 1 : onlineFilter === "offline" ? 0 : null;
     const kdClause = sort === "kd" ? ` AND p.kills>=${KD_MIN} AND p.deaths>0` : "";
     const onlineClause = onlineValue == null ? "" : " AND p.online=?";
-    const sql = `SELECT p.*, (SELECT total_value FROM bounties b WHERE b.target_uuid=p.uuid AND b.status='active') AS active_bounty_value, (SELECT currency FROM bounties b WHERE b.target_uuid=p.uuid AND b.status='active') AS active_bounty_currency FROM players p WHERE (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE)${kdClause}${onlineClause} ORDER BY ${sortExpression} DESC, p.uuid ASC LIMIT ? OFFSET ?`;
+    const sql = `SELECT p.*, (SELECT total_value FROM bounties b WHERE b.target_uuid=p.uuid AND b.status='active') AS active_bounty_value, (SELECT currency FROM bounties b WHERE b.target_uuid=p.uuid AND b.status='active') AS active_bounty_currency FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) AND (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE)${kdClause}${onlineClause} ORDER BY ${sortExpression} DESC, p.uuid ASC LIMIT ? OFFSET ?`;
     const items = onlineValue == null ? all(sql, search, `%${safeSearch}%`, limit, offset) : all(sql, search, `%${safeSearch}%`, onlineValue, limit, offset);
-    const countSql = `SELECT count(*) AS total FROM players p WHERE (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE)${kdClause}${onlineClause}`;
+    const countSql = `SELECT count(*) AS total FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) AND (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE)${kdClause}${onlineClause}`;
     const total = (onlineValue == null ? get(countSql, search, `%${safeSearch}%`) : get(countSql, search, `%${safeSearch}%`, onlineValue))?.total || 0;
     return reply(res, 200, { items: items.map((row) => ({ ...publicPlayer(row), activeBountyValue: row.active_bounty_value ?? null, currency: row.active_bounty_currency || CURRENCY })), total, page, limit, hasMore: offset + items.length < total, onlineFilterUnavailable: false });
   }
@@ -358,8 +366,8 @@ async function apiHandler(req, res) {
     if (!row) return fail(res, 404, "player_not_found", "No tracked player matches this profile.");
     const { page, limit, offset } = pageResponse(url, 20, 100);
     const profile = publicPlayer(row); const stats = aggregatePlayer(row.uuid);
-    const historyRows = all("SELECT * FROM activity WHERE actor_uuid=? OR target_uuid=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", row.uuid, row.uuid, limit, offset);
-    const historyTotal = get("SELECT count(*) AS total FROM activity WHERE actor_uuid=? OR target_uuid=?", row.uuid, row.uuid)?.total || 0;
+    const historyRows = all("SELECT * FROM activity WHERE (actor_uuid=? OR target_uuid=?) AND (actor_uuid IS NULL OR actor_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AND (target_uuid IS NULL OR target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", row.uuid, row.uuid, limit, offset);
+    const historyTotal = get("SELECT count(*) AS total FROM activity WHERE (actor_uuid=? OR target_uuid=?) AND (actor_uuid IS NULL OR actor_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AND (target_uuid IS NULL OR target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players))", row.uuid, row.uuid)?.total || 0;
     return reply(res, 200, { player: profile, statistics: { ...profile, playerKills: row.kills, playerDeaths: row.deaths, kd: kdRatio(row.kills, row.deaths), ...stats }, history: historyRows.map(publicActivity), historyPage: { total: historyTotal, page, limit, hasMore: offset + historyRows.length < historyTotal } });
   }
   if (req.method === "GET" && path === "/leaderboards") {
@@ -379,13 +387,13 @@ async function apiHandler(req, res) {
     const minValueRaw = url.searchParams.get("minValue") || ""; const minValue = minValueRaw ? Number(minValueRaw) : 0;
     const nearExpiry = url.searchParams.get("nearExpiry") || "";
     if (!Number.isSafeInteger(minValue) || minValue < 0 || (nearExpiry && !["24h", "72h"].includes(nearExpiry))) return fail(res, 400, "invalid_bounty_filter", "Reward and expiry filters are invalid.");
-    const conditions = ["b.status='active'", "(b.expires_at IS NULL OR b.expires_at > ?)"]; const filterArgs = [ISO_NOW()];
+    const conditions = ["b.status='active'", "b.target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)", "(b.expires_at IS NULL OR b.expires_at > ?)"]; const filterArgs = [ISO_NOW()];
     if (minValue > 0) { conditions.push("b.total_value>=?"); filterArgs.push(minValue); }
     if (nearExpiry) { conditions.push("b.expires_at IS NOT NULL AND b.expires_at<=?"); filterArgs.push(new Date(Date.now() + (nearExpiry === "24h" ? 24 : 72) * 3600_000).toISOString()); }
     const where = conditions.join(" AND ");
     const rows = all(`SELECT b.*, (SELECT count(DISTINCT contributor_uuid) FROM contributions c WHERE c.bounty_id=b.id) AS contributor_count FROM bounties b WHERE ${where} ORDER BY ${order} LIMIT ? OFFSET ?`, ...filterArgs, limit, offset);
     const total = get(`SELECT count(*) AS total FROM bounties b WHERE ${where}`, ...filterArgs)?.total || 0;
-    const trackedPlayers = sort === "_unused" ? [] : all("SELECT uuid, username FROM players ORDER BY username COLLATE NOCASE LIMIT 200");
+    const trackedPlayers = sort === "_unused" ? [] : all("SELECT uuid, username FROM players WHERE uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) ORDER BY username COLLATE NOCASE LIMIT 200");
     return reply(res, 200, { items: rows.map(publicBounty), players: trackedPlayers, currency: CURRENCY, minimumAmount: MIN_BOUNTY, maximumAmount: MAX_BOUNTY, total, page, limit, hasMore: offset + rows.length < total });
   }
   if (req.method === "GET" && path === "/bounties/history") {
@@ -412,7 +420,7 @@ async function apiHandler(req, res) {
     const id = decodeURIComponent(path.slice("/bounties/".length));
     const bounty = get("SELECT * FROM bounties WHERE id=?", id);
     if (!bounty) return fail(res, 404, "bounty_not_found", "No public bounty matches this record.");
-    const contributions = all(`SELECT c.amount, c.created_at, p.uuid, p.username, p.skin_url FROM contributions c JOIN players p ON p.uuid=c.contributor_uuid WHERE c.bounty_id=? ORDER BY c.created_at ASC`, id).map((c) => ({ amount: c.amount, createdAt: c.created_at, player: { uuid: c.uuid, username: c.username, skinUrl: c.skin_url || null } }));
+    const contributions = all(`SELECT c.amount, c.created_at, p.uuid, p.username, p.skin_url FROM contributions c JOIN players p ON p.uuid=c.contributor_uuid WHERE c.bounty_id=? AND p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) ORDER BY c.created_at ASC`, id).map((c) => ({ amount: c.amount, createdAt: c.created_at, player: { uuid: c.uuid, username: c.username, skinUrl: c.skin_url || null } }));
     return reply(res, 200, { bounty: publicBounty(bounty), contributions });
   }
   if (req.method === "GET" && path === "/weapons") {
@@ -424,8 +432,8 @@ async function apiHandler(req, res) {
   }
   if (req.method === "GET" && path === "/activity") {
     const { page, limit, offset } = pageResponse(url, 30, 100);
-    const rows = all("SELECT * FROM activity ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", limit, offset);
-    const total = get("SELECT count(*) AS total FROM activity")?.total || 0;
+    const rows = all("SELECT * FROM activity WHERE (actor_uuid IS NULL OR actor_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AND (target_uuid IS NULL OR target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", limit, offset);
+    const total = get("SELECT count(*) AS total FROM activity WHERE (actor_uuid IS NULL OR actor_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) AND (target_uuid IS NULL OR target_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players))")?.total || 0;
     return reply(res, 200, { items: rows.map(publicActivity), total, page, limit, hasMore: offset + rows.length < total });
   }
   if (req.method === "GET" && path === "/me") {
@@ -501,6 +509,41 @@ async function apiHandler(req, res) {
     run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'requested', ?, ?, ?)", txId, session.player_uuid, targetUuid, active?.id || null, itemAmount, storedCurrency, fullKey, now, now);
     addAudit(session.player_uuid, "item_bounty_placement_requested", "transaction", txId, "requested");
     return reply(res, 202, { transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", txId)) }, { "Cache-Control": "private, no-store" });
+  }
+
+  if (path === "/admin/settings" && (req.method === "GET" || req.method === "POST")) {
+    if (!requireSmpAdmin(req, res)) return;
+    if (req.method === "GET") return reply(res, 200, { mirrorChatEnabled: mirrorChatEnabled() }, { "Cache-Control": "no-store" });
+    const { value } = await readJson(req, 4096);
+    if (typeof value.mirrorChatEnabled !== "boolean") return fail(res, 400, "invalid_setting", "mirrorChatEnabled must be true or false.");
+    const enabled = value.mirrorChatEnabled;
+    const now = ISO_NOW();
+    run("INSERT INTO smp_settings (key, value, updated_at) VALUES ('mirror_chat_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", enabled ? "1" : "0", now);
+    addAudit("admin", "chat_mirror_setting_changed", "setting", "mirror_chat_enabled", enabled ? "enabled" : "disabled");
+    return reply(res, 200, { ok: true, mirrorChatEnabled: enabled, updatedAt: now }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/players" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const search = String(url.searchParams.get("search") || "").trim().slice(0, 32);
+    const safe = search.replace(/[\\%_]/g, "\\$&");
+    const rows = all("SELECT p.uuid, p.username, p.kills, p.deaths, p.playtime_seconds, p.online, p.last_seen FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players) AND (?='' OR p.username LIKE ? ESCAPE '\\' COLLATE NOCASE) ORDER BY p.last_seen DESC LIMIT ?", search, `%${safe}%`, limit);
+    return reply(res, 200, { items: rows.map(p => ({ uuid:p.uuid, username:p.username, kills:p.kills, deaths:p.deaths, playtimeSeconds:p.playtime_seconds, online:p.online == null ? null : Boolean(p.online), lastSeen:p.last_seen })), total: rows.length });
+  }
+  const removePlayerMatch = path.match(/^\/admin\/players\/([0-9a-f-]{36})$/i);
+  if (removePlayerMatch && req.method === "DELETE") {
+    if (!requireSmpAdmin(req, res)) return;
+    const uuid = removePlayerMatch[1].toLowerCase();
+    const player = get("SELECT uuid, username FROM players WHERE uuid=?", uuid);
+    if (!player) return fail(res, 404, "player_not_found", "Player not found in tracked records.");
+    const now = ISO_NOW();
+    transaction(() => {
+      run("INSERT INTO smp_hidden_players (player_uuid, hidden_at, hidden_by) VALUES (?, ?, 'admin') ON CONFLICT(player_uuid) DO UPDATE SET hidden_at=excluded.hidden_at, hidden_by=excluded.hidden_by", uuid, now);
+      run("DELETE FROM smp_chat_messages WHERE player_uuid=?", uuid);
+      run("UPDATE bounties SET status='cancelled', updated_at=?, version=version+1 WHERE target_uuid=? AND status='active'", now, uuid);
+      addAudit("admin", "player_removed_from_public_site", "player", uuid, "hidden_and_future_imports_ignored");
+    });
+    return reply(res, 200, { ok: true, player: player.username, hidden: true, note: "Stored records were retained internally; public pages and future imports are hidden." });
   }
 
   if (path === "/admin/ping" && req.method === "GET") {
@@ -602,6 +645,9 @@ function pluginHandler(req, res, url, path, body) {
     run("INSERT INTO link_codes (code_hash, player_uuid, expires_at, created_at) VALUES (?, ?, ?, ?)", hash(code), uuid, expiresAt, now);
     return reply(res, 201, { code, expiresAt });
   }
+  if (req.method === "GET" && path === "/plugin/settings") {
+    return reply(res, 200, { mirrorChatEnabled: mirrorChatEnabled() });
+  }
   if (req.method === "POST" && path === "/plugin/chat") {
     const eventId = String(body.eventId || "");
     const uuid = String(body.uuid || "").toLowerCase();
@@ -611,6 +657,8 @@ function pluginHandler(req, res, url, path, body) {
       || !message.trim() || message.length > 256 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(message)) {
       return fail(res, 400, "invalid_chat_event", "Chat event details are invalid.");
     }
+    if (!mirrorChatEnabled()) return reply(res, 200, { ok: true, ignored: true, reason: "chat_mirroring_disabled" });
+    if (isHiddenPlayer(uuid)) return reply(res, 200, { ok: true, ignored: true, reason: "player_hidden" });
     if (get("SELECT 1 FROM smp_chat_messages WHERE source_event_id=?", eventId)) return reply(res, 200, { ok: true, duplicate: true });
     ensurePlayer(uuid, username, now);
     run("INSERT INTO smp_chat_messages (id, source_event_id, player_uuid, username, message, source, status, created_at, updated_at, delivered_at) VALUES (?, ?, ?, ?, ?, 'minecraft', 'delivered', ?, ?, ?)", randomUUID(), eventId, uuid, username, message, now, now, now);
@@ -707,6 +755,7 @@ function pluginHandler(req, res, url, path, body) {
     const uuid = String(body.uuid || "").toLowerCase(); const username = String(body.username || "");
     const online = body.online;
     if (!/^[A-Za-z0-9-]{8,100}$/.test(eventId) || !validatePlayerIdentity(uuid, username) || typeof online !== "boolean") return fail(res, 400, "invalid_presence_event", "Presence event details are invalid.");
+    if (isHiddenPlayer(uuid)) return reply(res, 200, { ok: true, ignored: true, reason: "player_hidden" });
     if (get("SELECT 1 FROM activity WHERE source_event_id=?", eventId)) return reply(res, 200, { ok: true, duplicate: true });
     transaction(() => {
       ensurePlayer(uuid, username, now);
@@ -722,7 +771,7 @@ function pluginHandler(req, res, url, path, body) {
       if (body.completeOnlineSnapshot === true) run("UPDATE players SET online=0, updated_at=?", now);
       for (const p of body.players) {
         const uuid = String(p.uuid || "").toLowerCase(); const username = String(p.username || "");
-        if (!validatePlayerIdentity(uuid, username)) continue;
+        if (!validatePlayerIdentity(uuid, username) || isHiddenPlayer(uuid)) continue;
         ensurePlayer(uuid, username, now);
         const values = ["kills", "deaths", "mobKills", "playtimeSeconds", "bestStreak", "currentStreak", "blocksMined"];
         if (values.some((key) => p[key] != null && (!Number.isSafeInteger(p[key]) || p[key] < 0))) continue;
