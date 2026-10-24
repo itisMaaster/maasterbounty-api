@@ -27,6 +27,30 @@ export class MaasterBountyApi extends DurableObject {
     this.ready = ctx.blockConcurrencyWhile(async () => {
       bindDurableStorage(ctx.storage);
       ctx.storage.sql.exec(schemaSql);
+      // Additive-only community tables. Existing tables and records are left untouched.
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_announcements (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        author TEXT NOT NULL DEFAULT 'Maaster',
+        created_at TEXT NOT NULL
+      )`);
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_chat_messages (
+        id TEXT PRIMARY KEY,
+        source_event_id TEXT UNIQUE,
+        player_uuid TEXT,
+        username TEXT NOT NULL,
+        message TEXT NOT NULL CHECK (length(message) BETWEEN 1 AND 256),
+        source TEXT NOT NULL CHECK (source IN ('minecraft', 'admin')),
+        status TEXT NOT NULL DEFAULT 'delivered' CHECK (status IN ('pending', 'processing', 'delivered', 'failed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT
+      )`);
+      ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_announcements_active_created ON smp_announcements(active, pinned, created_at)");
+      ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_chat_status_created ON smp_chat_messages(status, created_at)");
       if (await ctx.storage.getAlarm() === null) {
         await ctx.storage.setAlarm(Date.now() + 60_000);
       }
