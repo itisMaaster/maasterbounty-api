@@ -154,8 +154,27 @@ function validatePlayerIdentity(uuid, username) {
 function isHiddenPlayer(uuid) {
   return Boolean(uuid && get("SELECT 1 FROM smp_hidden_players WHERE player_uuid=?", String(uuid).toLowerCase()));
 }
+function settingEnabled(key, fallback = true) {
+  const row = get("SELECT value FROM smp_settings WHERE key=?", key);
+  return row == null ? fallback : row.value !== "0";
+}
 function mirrorChatEnabled() {
-  return get("SELECT value FROM smp_settings WHERE key='mirror_chat_enabled'")?.value !== "0";
+  return settingEnabled("mirror_chat_enabled", true);
+}
+function bountiesEnabled() {
+  return settingEnabled("bounties_enabled", true);
+}
+function knownMinecraftMaterial(material) {
+  return Boolean(material && get("SELECT 1 FROM smp_material_catalog WHERE material=?", material));
+}
+function deductInventorySnapshot(uuid, material, amount, now) {
+  if (!uuid || !material || !Number.isSafeInteger(Number(amount)) || Number(amount) < 1) return;
+  const row = get("SELECT inventory_json FROM smp_inventory_snapshots WHERE player_uuid=?", uuid);
+  if (!row) return;
+  const items = safeJson(row.inventory_json) || {};
+  const current = Number(items[material] || 0);
+  items[material] = Math.max(0, current - Number(amount));
+  run("UPDATE smp_inventory_snapshots SET inventory_json=?, updated_at=? WHERE player_uuid=?", JSON.stringify(items), now, uuid);
 }
 function ensurePlayer(uuid, username, now = ISO_NOW()) {
   if (isHiddenPlayer(uuid)) return false;
@@ -299,6 +318,18 @@ async function apiHandler(req, res) {
       .map((row) => ({ id: row.id, title: row.title, body: row.body, pinned: Boolean(row.pinned), author: row.author, createdAt: row.created_at }));
     return reply(res, 200, { items, total: get("SELECT count(*) AS total FROM smp_announcements WHERE active=1")?.total || 0 });
   }
+  if (req.method === "GET" && path === "/materials") {
+    const limit = Math.min(3000, Math.max(1, Number(url.searchParams.get("limit") || 2000)));
+    const search = String(url.searchParams.get("search") || "").trim().toUpperCase().slice(0, 64);
+    const safe = search.replace(/[\\%_]/g, "\\$&");
+    const rows = search
+      ? all("SELECT material FROM smp_material_catalog WHERE material LIKE ? ESCAPE '\\' ORDER BY material LIMIT ?", `%${safe}%`, limit)
+      : all("SELECT material FROM smp_material_catalog ORDER BY material LIMIT ?", limit);
+    const total = get("SELECT count(*) AS total FROM smp_material_catalog")?.total || 0;
+    const latest = get("SELECT max(updated_at) AS updatedAt FROM smp_material_catalog")?.updatedAt || null;
+    return reply(res, 200, { items: rows.map(row => ({ material: row.material, displayName: row.material.toLowerCase().split("_").map(word => word ? word[0].toUpperCase() + word.slice(1) : "").join(" ") })), total, updatedAt: latest });
+  }
+
   if (req.method === "GET" && path === "/chat") {
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
     const rows = all("SELECT id, username, message, source, created_at FROM smp_chat_messages WHERE status='delivered' AND (player_uuid IS NULL OR player_uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)) ORDER BY created_at DESC LIMIT ?", limit).reverse();
@@ -475,6 +506,7 @@ async function apiHandler(req, res) {
   }
   if (req.method === "POST" && path === "/bounties") {
     const session = requireSession(req, res); if (!session) return;
+    if (!bountiesEnabled()) return fail(res, 503, "bounties_paused", "New bounty placements are temporarily disabled by the server owner.");
     const idempotency = String(req.headers["idempotency-key"] || "");
     if (!/^[A-Za-z0-9_-]{12,100}$/.test(idempotency)) return fail(res, 400, "idempotency_key_required", "A valid idempotency key is required.");
     const { value } = await readJson(req, 4096);
@@ -489,13 +521,24 @@ async function apiHandler(req, res) {
       || !Number.isSafeInteger(itemAmount) || itemAmount < 1 || itemAmount > MAX_BOUNTY_ITEMS) {
       return fail(res, 400, "invalid_bounty", `Choose a valid Minecraft item and a quantity from 1 to ${MAX_BOUNTY_ITEMS}.`);
     }
+    const catalogCount = get("SELECT count(*) AS total FROM smp_material_catalog")?.total || 0;
+    if (catalogCount < 1) return fail(res, 503, "item_catalog_not_ready", "The Minecraft item catalog is still syncing from the server. Try again in a moment.");
+    if (!knownMinecraftMaterial(itemMaterial)) return fail(res, 400, "invalid_minecraft_item", "Choose an item available on this Minecraft server.");
+    const inventorySnapshot = get("SELECT inventory_json, online, updated_at FROM smp_inventory_snapshots WHERE player_uuid=?", session.player_uuid);
+    if (!inventorySnapshot) return fail(res, 409, "inventory_snapshot_missing", "We do not have a saved inventory snapshot for your linked Minecraft account yet. Join the server once, then try again.");
+    let snapshotItems = safeJson(inventorySnapshot.inventory_json);
+    if (!snapshotItems || typeof snapshotItems !== "object" || Array.isArray(snapshotItems)) snapshotItems = {};
+    const storedCurrency = `${ITEM_CURRENCY_PREFIX}${itemMaterial}`;
+    const pendingReservation = get("SELECT coalesce(sum(amount), 0) AS amount FROM transactions WHERE player_uuid=? AND type='placement' AND currency=? AND status IN ('requested','processing')", session.player_uuid, storedCurrency)?.amount || 0;
+    const snapshotAmount = Number(snapshotItems[itemMaterial] || 0);
+    const availableAmount = Math.max(0, snapshotAmount - Number(pendingReservation || 0));
+    if (availableAmount < itemAmount) return fail(res, 409, "insufficient_item_inventory", `Your last saved inventory shows ${availableAmount} available ${itemMaterial} item(s) after pending requests, but you selected ${itemAmount}. The Paper server still verifies and removes the actual items before activating any bounty.`);
     if (targetUuid === session.player_uuid) return fail(res, 400, "self_bounty_forbidden", "You cannot place a bounty on yourself.");
     if (!get("SELECT 1 FROM players WHERE uuid=?", targetUuid)) return fail(res, 404, "target_not_found", "The target must be a tracked player.");
     const fullKey = `${session.player_uuid}:${idempotency}`;
     const existing = get("SELECT * FROM transactions WHERE idempotency_key=?", fullKey);
     if (existing) return reply(res, 202, { transaction: transactionView(existing) }, { "Cache-Control": "private, no-store" });
 
-    const storedCurrency = `${ITEM_CURRENCY_PREFIX}${itemMaterial}`;
     const active = get("SELECT * FROM bounties WHERE target_uuid=? AND status='active'", targetUuid);
     if (active && storedItemMaterial(active.currency) !== itemMaterial) {
       return fail(res, 409, "active_bounty_item_mismatch", "This player already has an active bounty with a different item. Wait for it to be claimed or expire first.");
@@ -507,20 +550,113 @@ async function apiHandler(req, res) {
 
     const now = ISO_NOW(); const txId = randomUUID();
     run("INSERT INTO transactions (id, type, player_uuid, target_uuid, bounty_id, amount, currency, status, idempotency_key, created_at, updated_at) VALUES (?, 'placement', ?, ?, ?, ?, ?, 'requested', ?, ?, ?)", txId, session.player_uuid, targetUuid, active?.id || null, itemAmount, storedCurrency, fullKey, now, now);
-    addAudit(session.player_uuid, "item_bounty_placement_requested", "transaction", txId, "requested");
-    return reply(res, 202, { transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", txId)) }, { "Cache-Control": "private, no-store" });
+    addAudit(session.player_uuid, "item_bounty_placement_requested", "transaction", txId, inventorySnapshot.online ? "requested_from_online_account" : "requested_from_saved_offline_inventory");
+    return reply(res, 202, {
+      transaction: transactionView(get("SELECT * FROM transactions WHERE id=?", txId)),
+      inventory: { checkedFromSavedSnapshot: true, playerOnline: Boolean(inventorySnapshot.online), snapshotAt: inventorySnapshot.updated_at, availableBeforeRequest: availableAmount }
+    }, { "Cache-Control": "private, no-store" });
+  }
+
+  if (path === "/admin/dashboard" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const count = (sql, ...args) => get(sql, ...args)?.total || 0;
+    const statusCounts = all("SELECT status, count(*) AS total FROM transactions GROUP BY status").reduce((out, row) => { out[row.status] = row.total; return out; }, {});
+    return reply(res, 200, {
+      server: currentServer(),
+      totals: {
+        players: count("SELECT count(*) AS total FROM players"), visiblePlayers: count("SELECT count(*) AS total FROM players p WHERE p.uuid NOT IN (SELECT player_uuid FROM smp_hidden_players)"),
+        hiddenPlayers: count("SELECT count(*) AS total FROM smp_hidden_players"), onlinePlayers: count("SELECT count(*) AS total FROM players WHERE online=1"),
+        activeBounties: count("SELECT count(*) AS total FROM bounties WHERE status='active'"), pendingTransactions: count("SELECT count(*) AS total FROM transactions WHERE status IN ('requested','processing','manual_review')"),
+        activeAnnouncements: count("SELECT count(*) AS total FROM smp_announcements WHERE active=1"), chatMessages: count("SELECT count(*) AS total FROM smp_chat_messages WHERE status='delivered'"),
+        inventorySnapshots: count("SELECT count(*) AS total FROM smp_inventory_snapshots"), catalogItems: count("SELECT count(*) AS total FROM smp_material_catalog")
+      }, statusCounts, settings: { mirrorChatEnabled: mirrorChatEnabled(), bountiesEnabled: bountiesEnabled() }, generatedAt: ISO_NOW()
+    }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/bounties" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const status = String(url.searchParams.get("status") || "active");
+    if (!(["active", "claimed", "expired", "cancelled", "under_review", "all"].includes(status))) return fail(res, 400, "invalid_bounty_status", "Bounty status filter is invalid.");
+    const rows = status === "all" ? all("SELECT * FROM bounties ORDER BY updated_at DESC LIMIT ?", limit) : all("SELECT * FROM bounties WHERE status=? ORDER BY updated_at DESC LIMIT ?", status, limit);
+    const items = rows.map(row => {
+      const bounty = publicBounty(row);
+      const target = get("SELECT username FROM players WHERE uuid=?", row.target_uuid);
+      const hunter = row.claimed_by ? get("SELECT username FROM players WHERE uuid=?", row.claimed_by) : null;
+      return { ...bounty, targetUsername: target?.username || "Unknown", targetUuid: row.target_uuid, hunterUsername: hunter?.username || null, paymentStatus: row.payment_status, version: row.version };
+    });
+    return reply(res, 200, { items, total: status === "all" ? countAllBounties() : (get("SELECT count(*) AS total FROM bounties WHERE status=?", status)?.total || 0), status }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/transactions" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const status = String(url.searchParams.get("status") || "");
+    const type = String(url.searchParams.get("type") || "");
+    if (status && !["requested", "processing", "completed", "failed", "manual_review"].includes(status)) return fail(res, 400, "invalid_transaction_status", "Transaction status filter is invalid.");
+    if (type && !["placement", "payout", "refund"].includes(type)) return fail(res, 400, "invalid_transaction_type", "Transaction type filter is invalid.");
+    const conditions = []; const args = [];
+    if (status) { conditions.push("t.status=?"); args.push(status); }
+    if (type) { conditions.push("t.type=?"); args.push(type); }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = all(`SELECT t.*, p.username AS player_username, target.username AS target_username FROM transactions t LEFT JOIN players p ON p.uuid=t.player_uuid LEFT JOIN players target ON target.uuid=t.target_uuid ${where} ORDER BY t.created_at DESC LIMIT ?`, ...args, limit);
+    return reply(res, 200, { items: rows.map(row => ({ ...transactionView(row), playerUuid: row.player_uuid, playerUsername: row.player_username || "Unknown", targetUuid: row.target_uuid, targetUsername: row.target_username || null, bountyId: row.bounty_id, errorCode: row.safe_error_code || null })), total: rows.length }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/inventory-snapshots" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const search = String(url.searchParams.get("search") || "").trim().slice(0, 32);
+    const safe = search.replace(/[\\%_]/g, "\\$&");
+    const rows = all(`SELECT s.player_uuid, s.username, s.inventory_json, s.online, s.updated_at,
+      EXISTS (SELECT 1 FROM smp_hidden_players h WHERE h.player_uuid=s.player_uuid) AS hidden
+      FROM smp_inventory_snapshots s
+      WHERE (?='' OR s.username LIKE ? ESCAPE '\\' COLLATE NOCASE)
+      ORDER BY s.updated_at DESC LIMIT ?`, search, `%${safe}%`, limit);
+    const items = rows.map(row => {
+      const snapshot = safeJson(row.inventory_json);
+      return { playerUuid: row.player_uuid, username: row.username, online: Boolean(row.online), hidden: Boolean(row.hidden),
+        itemTypes: snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) ? Object.keys(snapshot).length : 0,
+        updatedAt: row.updated_at };
+    });
+    return reply(res, 200, { items, total: rows.length }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/audit" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const rows = all("SELECT id, actor_uuid, action, entity_type, entity_id, result, created_at FROM audit_log ORDER BY created_at DESC LIMIT ?", limit);
+    return reply(res, 200, { items: rows.map(row => ({ id: row.id, actorUuid: row.actor_uuid, action: row.action, entityType: row.entity_type, entityId: row.entity_id, result: row.result, createdAt: row.created_at })), total: rows.length }, { "Cache-Control": "no-store" });
+  }
+  if (path === "/admin/chat" && req.method === "GET") {
+    if (!requireSmpAdmin(req, res)) return;
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 50)));
+    const rows = all("SELECT id, player_uuid, username, message, source, status, created_at, delivered_at FROM smp_chat_messages ORDER BY created_at DESC LIMIT ?", limit);
+    return reply(res, 200, { items: rows.map(row => ({ id: row.id, playerUuid: row.player_uuid, username: row.username, message: row.message, source: row.source, status: row.status, createdAt: row.created_at, deliveredAt: row.delivered_at })), total: rows.length, mirrorChatEnabled: mirrorChatEnabled() }, { "Cache-Control": "no-store" });
+  }
+  const adminChatDeleteMatch = path.match(/^\/admin\/chat\/([0-9a-f-]{36})$/i);
+  if (adminChatDeleteMatch && req.method === "DELETE") {
+    if (!requireSmpAdmin(req, res)) return;
+    const id = adminChatDeleteMatch[1].toLowerCase();
+    const row = get("SELECT id, username, source, status FROM smp_chat_messages WHERE id=?", id);
+    if (!row) return fail(res, 404, "chat_message_not_found", "Chat message not found.");
+    if (row.status !== "delivered") return fail(res, 409, "chat_message_not_delivered", "Only delivered messages can be removed from the public feed.");
+    run("UPDATE smp_chat_messages SET status='failed', updated_at=? WHERE id=? AND status='delivered'", ISO_NOW(), id);
+    addAudit("admin", "chat_message_removed_from_public_feed", "chat_message", id, `${row.source}:${row.username}`);
+    return reply(res, 200, { ok: true, id, removedFromPublicFeed: true });
   }
 
   if (path === "/admin/settings" && (req.method === "GET" || req.method === "POST")) {
     if (!requireSmpAdmin(req, res)) return;
-    if (req.method === "GET") return reply(res, 200, { mirrorChatEnabled: mirrorChatEnabled() }, { "Cache-Control": "no-store" });
+    if (req.method === "GET") return reply(res, 200, { mirrorChatEnabled: mirrorChatEnabled(), bountiesEnabled: bountiesEnabled() }, { "Cache-Control": "no-store" });
     const { value } = await readJson(req, 4096);
-    if (typeof value.mirrorChatEnabled !== "boolean") return fail(res, 400, "invalid_setting", "mirrorChatEnabled must be true or false.");
-    const enabled = value.mirrorChatEnabled;
+    if (typeof value.mirrorChatEnabled !== "boolean" && typeof value.bountiesEnabled !== "boolean") return fail(res, 400, "invalid_setting", "Provide mirrorChatEnabled and/or bountiesEnabled as a boolean.");
     const now = ISO_NOW();
-    run("INSERT INTO smp_settings (key, value, updated_at) VALUES ('mirror_chat_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", enabled ? "1" : "0", now);
-    addAudit("admin", "chat_mirror_setting_changed", "setting", "mirror_chat_enabled", enabled ? "enabled" : "disabled");
-    return reply(res, 200, { ok: true, mirrorChatEnabled: enabled, updatedAt: now }, { "Cache-Control": "no-store" });
+    if (typeof value.mirrorChatEnabled === "boolean") {
+      run("INSERT INTO smp_settings (key, value, updated_at) VALUES ('mirror_chat_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", value.mirrorChatEnabled ? "1" : "0", now);
+      addAudit("admin", "chat_mirror_setting_changed", "setting", "mirror_chat_enabled", value.mirrorChatEnabled ? "enabled" : "disabled");
+    }
+    if (typeof value.bountiesEnabled === "boolean") {
+      run("INSERT INTO smp_settings (key, value, updated_at) VALUES ('bounties_enabled', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", value.bountiesEnabled ? "1" : "0", now);
+      addAudit("admin", "bounty_placements_setting_changed", "setting", "bounties_enabled", value.bountiesEnabled ? "enabled" : "disabled");
+    }
+    return reply(res, 200, { ok: true, mirrorChatEnabled: mirrorChatEnabled(), bountiesEnabled: bountiesEnabled(), updatedAt: now }, { "Cache-Control": "no-store" });
   }
   if (path === "/admin/players" && req.method === "GET") {
     if (!requireSmpAdmin(req, res)) return;
@@ -559,9 +695,9 @@ async function apiHandler(req, res) {
     const now = ISO_NOW();
     transaction(() => {
       run("INSERT INTO smp_hidden_players (player_uuid, hidden_at, hidden_by) VALUES (?, ?, 'admin') ON CONFLICT(player_uuid) DO UPDATE SET hidden_at=excluded.hidden_at, hidden_by=excluded.hidden_by", uuid, now);
-      run("DELETE FROM smp_chat_messages WHERE player_uuid=?", uuid);
-      run("UPDATE bounties SET status='cancelled', updated_at=?, version=version+1 WHERE target_uuid=? AND status='active'", now, uuid);
-      addAudit("admin", "player_removed_from_public_site", "player", uuid, "hidden_and_future_imports_ignored");
+      // Visibility is a reversible profile setting: retain chat history and bounty records.
+      // Public endpoints filter hidden players, and future plugin imports are ignored by other routes.
+      addAudit("admin", "player_hidden_from_public_site", "player", uuid, "profile_hidden_history_and_bounties_retained");
     });
     return reply(res, 200, { ok: true, player: player.username, hidden: true, note: "Stored records were retained internally; public pages and future imports are hidden." });
   }
@@ -582,6 +718,20 @@ async function apiHandler(req, res) {
     run("INSERT INTO smp_announcements (id, title, body, pinned, active, author, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)", id, title, body, pinned, "Maaster", now);
     addAudit("admin", "announcement_created", "announcement", id, "published");
     return reply(res, 201, { item: { id, title, body, pinned: Boolean(pinned), author: "Maaster", createdAt: now } });
+  }
+  const announcementEditMatch = path.match(/^\/admin\/announcements\/([0-9a-f-]{36})$/i);
+  if (announcementEditMatch && req.method === "POST") {
+    if (!requireSmpAdmin(req, res)) return;
+    const id = announcementEditMatch[1].toLowerCase();
+    const row = get("SELECT id FROM smp_announcements WHERE id=? AND active=1", id);
+    if (!row) return fail(res, 404, "announcement_not_found", "Active announcement not found.");
+    const { value } = await readJson(req, 8192);
+    const title = String(value.title || "").trim(); const body = String(value.body || "").trim(); const pinned = value.pinned === true ? 1 : 0;
+    if (!title || title.length > 100 || !body || body.length > 3000) return fail(res, 400, "invalid_announcement", "Enter a title (1–100 characters) and message (1–3000 characters).");
+    run("UPDATE smp_announcements SET title=?, body=?, pinned=? WHERE id=? AND active=1", title, body, pinned, id);
+    addAudit("admin", "announcement_edited", "announcement", id, pinned ? "updated_and_pinned" : "updated");
+    const updated = get("SELECT id, title, body, pinned, author, created_at FROM smp_announcements WHERE id=?", id);
+    return reply(res, 200, { item: { id:updated.id, title:updated.title, body:updated.body, pinned:Boolean(updated.pinned), author:updated.author, createdAt:updated.created_at } });
   }
   const announcementDeleteMatch = path.match(/^\/admin\/announcements\/([0-9a-f-]{36})$/i);
   if (announcementDeleteMatch && req.method === "DELETE") {
@@ -641,6 +791,10 @@ async function apiHandler(req, res) {
   return fail(res, 404, "not_found", "Endpoint not found.");
 }
 
+function countAllBounties() {
+  return get("SELECT count(*) AS total FROM bounties")?.total || 0;
+}
+
 function transactionView(row) {
   const itemMaterial = storedItemMaterial(row.currency);
   return { id: row.id, type: row.type, status: row.status, amount: row.amount,
@@ -668,6 +822,61 @@ function pluginHandler(req, res, url, path, body) {
   if (req.method === "GET" && path === "/plugin/settings") {
     return reply(res, 200, { mirrorChatEnabled: mirrorChatEnabled() });
   }
+  if (req.method === "POST" && path === "/plugin/bridge-start") {
+    // A fresh bridge process invalidates any stale online flags left by a prior crash/restart.
+    transaction(() => {
+      run("INSERT INTO smp_settings (key, value, updated_at) VALUES ('bridge_session_started_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", now, now);
+      // Preserve the real capture timestamp; only invalidate the online flag on restart.
+      run("UPDATE smp_inventory_snapshots SET online=0");
+      run("UPDATE players SET online=0, updated_at=? WHERE online IS NULL OR online<>0", now);
+      addAudit(null, "bridge_session_started", "server", "maaster-smp-bridge", "online_inventory_snapshots_reset_until_refreshed");
+    });
+    return reply(res, 200, { ok: true, onlineSnapshotsReset: true, receivedAt: now });
+  }
+  if (req.method === "POST" && path === "/plugin/material-catalog") {
+    if (!Array.isArray(body.materials) || body.materials.length > 3000) return fail(res, 400, "invalid_material_catalog", "Material catalog must contain at most 3000 entries.");
+    const materials = [...new Set(body.materials.map(value => String(value || "").trim().toUpperCase()).filter(value => /^[A-Z][A-Z0-9_]{0,63}$/.test(value) && value !== "AIR"))];
+    if (materials.length < 100) return fail(res, 400, "incomplete_material_catalog", "The server supplied an unexpectedly small item catalog.");
+    transaction(() => {
+      run("DELETE FROM smp_material_catalog");
+      // Batch inserts to keep one catalog sync efficient on the Durable Object SQLite store.
+      for (let offset = 0; offset < materials.length; offset += 100) {
+        const batch = materials.slice(offset, offset + 100);
+        const valuesSql = batch.map(() => "(?, ?)").join(", ");
+        const values = batch.flatMap(material => [material, now]);
+        run(`INSERT INTO smp_material_catalog (material, updated_at) VALUES ${valuesSql}`, ...values);
+      }
+    });
+    return reply(res, 200, { ok: true, count: materials.length, updatedAt: now });
+  }
+  if (req.method === "POST" && path === "/plugin/inventory-snapshot") {
+    const uuid = String(body.uuid || "").toLowerCase();
+    const username = String(body.username || "");
+    const eventId = String(body.eventId || "");
+    const online = body.online;
+    if (!validatePlayerIdentity(uuid, username) || !/^[A-Za-z0-9-]{8,100}$/.test(eventId) || typeof online !== "boolean"
+      || !body.items || typeof body.items !== "object" || Array.isArray(body.items)) {
+      return fail(res, 400, "invalid_inventory_snapshot", "Inventory snapshot details are invalid.");
+    }
+    const entries = Object.entries(body.items);
+    if (entries.length > 1000) return fail(res, 400, "invalid_inventory_snapshot", "Inventory snapshot contains too many item types.");
+    const items = {};
+    for (const [rawMaterial, rawAmount] of entries) {
+      const material = String(rawMaterial || "").trim().toUpperCase();
+      const amount = typeof rawAmount === "number" ? rawAmount : Number(rawAmount);
+      if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(material) || !Number.isSafeInteger(amount) || amount < 1 || amount > 100000) {
+        return fail(res, 400, "invalid_inventory_snapshot", "Inventory snapshot item data is invalid.");
+      }
+      // The payload is HMAC-authenticated by the trusted Paper bridge. Keep valid item names even if
+      // the first catalog upload is still in flight, so a fast first join cannot save an empty snapshot.
+      items[material] = amount;
+    }
+    if (!isHiddenPlayer(uuid)) ensurePlayer(uuid, username, now);
+    run("INSERT INTO players (uuid, username, first_seen, last_seen, updated_at, online) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(uuid) DO UPDATE SET username=excluded.username, last_seen=CASE WHEN ?=1 THEN excluded.last_seen ELSE players.last_seen END, online=?, updated_at=excluded.updated_at", uuid, username, now, now, now, Number(online), Number(online), Number(online));
+    run("INSERT INTO smp_inventory_snapshots (player_uuid, username, inventory_json, online, updated_at, event_id) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(player_uuid) DO UPDATE SET username=excluded.username, inventory_json=excluded.inventory_json, online=excluded.online, updated_at=excluded.updated_at, event_id=excluded.event_id", uuid, username, JSON.stringify(items), Number(online), now, eventId);
+    return reply(res, 200, { ok: true, saved: true, itemTypes: Object.keys(items).length, online, updatedAt: now });
+  }
+
   if (req.method === "POST" && path === "/plugin/chat") {
     const eventId = String(body.eventId || "");
     const uuid = String(body.uuid || "").toLowerCase();
@@ -722,6 +931,7 @@ function pluginHandler(req, res, url, path, body) {
       || !/^[A-Za-z0-9_-]{12,100}$/.test(requestKey)) {
       return fail(res, 400, "invalid_bounty", `Choose a valid Minecraft item and a quantity from 1 to ${MAX_BOUNTY_ITEMS}.`);
     }
+    if (get("SELECT count(*) AS total FROM smp_material_catalog")?.total > 0 && !knownMinecraftMaterial(itemMaterial)) return fail(res, 400, "invalid_minecraft_item", "Item material is not available on this server.");
     if (playerUuid === targetUuid) return fail(res, 400, "self_bounty_forbidden", "You cannot place a bounty on yourself.");
     if (!get("SELECT 1 FROM players WHERE uuid=?", targetUuid)) return fail(res, 404, "player_not_found", "The target must be a tracked player.");
 
@@ -811,8 +1021,14 @@ function pluginHandler(req, res, url, path, body) {
     const type = url.searchParams.get("type") || "";
     if (type && !["placement", "payout", "refund"].includes(type)) return fail(res, 400, "invalid_transaction_type", "Transaction type is invalid.");
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 30)));
-    const candidates = type ? all("SELECT * FROM transactions WHERE type=? AND status IN ('requested','processing') ORDER BY created_at LIMIT ?", type, limit)
-      : all("SELECT * FROM transactions WHERE status IN ('requested','processing') ORDER BY created_at LIMIT ?", limit);
+    // A placement is sent to the Paper inventory-removal processor only when the bridge
+    // has recently confirmed that player online; stale online flags from a crash are ignored.
+    const recentSnapshotAfter = new Date(Date.now() - 90_000).toISOString();
+    const sessionStartedAt = get("SELECT value FROM smp_settings WHERE key='bridge_session_started_at'")?.value || recentSnapshotAfter;
+    const snapshotFreshnessCutoff = sessionStartedAt > recentSnapshotAfter ? sessionStartedAt : recentSnapshotAfter;
+    const onlinePlacementGate = "(t.type <> 'placement' OR EXISTS (SELECT 1 FROM smp_inventory_snapshots s WHERE s.player_uuid=t.player_uuid AND s.online=1 AND s.updated_at>=?))";
+    const candidates = type ? all(`SELECT t.* FROM transactions t WHERE t.type=? AND t.status IN ('requested','processing') AND ${onlinePlacementGate} ORDER BY t.created_at LIMIT ?`, type, snapshotFreshnessCutoff, limit)
+      : all(`SELECT t.* FROM transactions t WHERE t.status IN ('requested','processing') AND ${onlinePlacementGate} ORDER BY t.created_at LIMIT ?`, snapshotFreshnessCutoff, limit);
     const rows = [];
     for (const row of candidates) {
       if (row.type === "placement" && storedItemMaterial(row.currency)) {
@@ -853,7 +1069,8 @@ function pluginHandler(req, res, url, path, body) {
         }
         run("UPDATE transactions SET bounty_id=? WHERE id=?", bounty.id, txId);
         run("INSERT INTO contributions (id, bounty_id, contributor_uuid, amount, transaction_id, created_at) VALUES (?, ?, ?, ?, ?, ?)", randomUUID(), bounty.id, tx.player_uuid, tx.amount, txId, now);
-        addActivity("bounty_placed", tx.player_uuid, targetUuid, bounty.id, null, null);
+        deductInventorySnapshot(tx.player_uuid, storedItemMaterial(tx.currency), tx.amount, now);
+        addActivity("bounty_placed", tx.player_uuid, targetUuid, bounty.id, null, `${tx.amount}x ${storedItemMaterial(tx.currency) || "item"}`);
         addAudit(tx.player_uuid, "bounty_placement_confirmed", "bounty", bounty.id, "completed");
       } else if (tx.type === "payout") {
         const bounty = get("SELECT * FROM bounties WHERE id=?", tx.bounty_id);
