@@ -51,6 +51,18 @@ export class MaasterBountyApi extends DurableObject {
       )`);
       ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_announcements_active_created ON smp_announcements(active, pinned, created_at)");
       ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_chat_status_created ON smp_chat_messages(status, created_at)");
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`);
+      ctx.storage.sql.exec("INSERT OR IGNORE INTO smp_settings (key, value, updated_at) VALUES ('mirror_chat_enabled', '1', datetime('now'))");
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS smp_hidden_players (
+        player_uuid TEXT PRIMARY KEY,
+        hidden_at TEXT NOT NULL,
+        hidden_by TEXT NOT NULL DEFAULT 'admin'
+      )`);
+      ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_smp_hidden_players_uuid ON smp_hidden_players(player_uuid)");
       if (await ctx.storage.getAlarm() === null) {
         await ctx.storage.setAlarm(Date.now() + 60_000);
       }
